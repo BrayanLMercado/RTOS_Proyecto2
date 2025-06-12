@@ -85,7 +85,7 @@ try:
                 temperatures.clear() 
             if current_temperatures:
                 guardar_temps(current_temperatures)
-                print("Temperaturas guardadas:", current_temperatures)
+                #print("Temperaturas guardadas:", current_temperatures)
             last_temperature_dump = time.time()
             GPIO.output(26, GPIO.LOW)
         time.sleep(0.1)
