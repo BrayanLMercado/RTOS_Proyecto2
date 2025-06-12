@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -54,11 +53,13 @@
 #define TOUCH_START 4
 
 #define MAX_DUTY 4096
+#define INC 20
 
 /*EVENT GROUPS*/
 #define DATA_READY  (BIT0)
 #define DATA_SENT   (BIT1)
-#define PWM_DATA_READY (BIT2)
+#define PWM_MOTOR_DATA_READY (BIT2)
+#define PWM_SERVO_DATA_READY (BIT3)
 
 typedef struct{
   uint8_t i2c_address;
@@ -67,9 +68,10 @@ typedef struct{
   uint8_t screen_backlight;
 } lcd_i2c_device_t;
 
-static uint8_t timeFlag=0;
 static uint8_t s_pad_activated[NUM_TPINS];
 static uint32_t s_pad_init_val[NUM_TPINS];
+static uint64_t lastPress=0;
+
 char bloque [1000][8];
 char anguloServo[16];
 char velocidadMotor[16];
@@ -84,7 +86,6 @@ static void IRAM_ATTR touch_rtc_intr(void* args);
 void set_touch_thresholds(void);
 
 void init_pwm(void);
-static void senderTimer(TimerHandle_t timer);
 void init_gpio(void);
 static void IRAM_ATTR gpio_isr_handler(void* args);
 
@@ -107,8 +108,7 @@ void app_main(void){
   lcdData=xEventGroupCreate();
   adc=xQueueCreate(1000,16*sizeof(uint8_t));
   gpio_queue=xQueueCreate(10,sizeof(uint8_t));
-  TimerHandle_t xtimer=xTimerCreate("ReloadTimer",30000/portTICK_PERIOD_MS,pdTRUE,0,senderTimer);
-  xTimerStart(xtimer,0);
+  init_gpio();
   i2c_init();
   lcd_i2c_device_t my_lcd = {
       .i2c_port = I2C_NUM_1,
@@ -145,18 +145,17 @@ void adcTask(void *args){
     while(idx<1000){
       adc_oneshot_read(adc1_handle,ADC_CHANNEL_6,&adc_raw);
       temp=(adc_raw*100.0)/4095;
-      ESP_LOGW("ADC","TEMP: %f",temp);
       sprintf(bloque[idx++],"%.2f\n",temp);
-      vTaskDelay(50 / portTICK_PERIOD_MS);
-  }
-  xEventGroupSetBits(adcData,DATA_READY);
-  idx=0;
-  xQueueSend(adc,bloque,20/portTICK_PERIOD_MS);
-  xEventGroupWaitBits(adcData,DATA_SENT,true,true,portMAX_DELAY);
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+    idx=0;
+    xQueueSend(adc,bloque,20/portTICK_PERIOD_MS);
+    xEventGroupWaitBits(adcData,DATA_SENT,false,true,portMAX_DELAY);
   }
 }
 
 void uartAdcTask(void *args){
+  static uint64_t lastSent=0;
   uint8_t btn;
   uart_config_t conf={
     .baud_rate=115200,
@@ -167,18 +166,17 @@ void uartAdcTask(void *args){
     .flow_ctrl=UART_HW_FLOWCTRL_DISABLE,
   };
   ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 8192, 0, 0, NULL, 0));
-  ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+  ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, GPIO_NUM_17,UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
   ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &conf));
-  void* datosRP;
   while(1){
-    xEventGroupWaitBits(adcData,DATA_READY,true,true,portMAX_DELAY);
-    if(xQueueReceive(adc,&datosRP,portMAX_DELAY)&&(xQueueReceive(gpio_queue,&btn,portMAX_DELAY)||timeFlag==1)){
-      uart_write_bytes(UART_NUM_1,(const char*)datosRP,6*1000);
-      /*for (int i = 0; i < 1000; i++){
-          uart_write_bytes(UART_NUM_1, bloque[i], strlen(bloque[i]));
-      }*/
+    if( xQueueReceive(gpio_queue,&btn,20/portTICK_PERIOD_MS) || ((esp_timer_get_time()-lastSent)>=30000000)){
+      for (uint16_t idx = 0; idx < 1000; idx++){
+          uart_write_bytes(UART_NUM_1, bloque[idx], strlen(bloque[idx]));
+      }
+      //ESP_LOGW("UART","DATA SENT");
+      lastSent=esp_timer_get_time();
+      xEventGroupSetBits(adcData,DATA_SENT);
     }
-    xEventGroupSetBits(adcData,DATA_SENT);
   }
 }
 
@@ -187,7 +185,7 @@ void lcdTask(void* args){
   char* msg="Velocidad:";
   char* msg2="Angulo Servo:";
   while(1){
-    xEventGroupWaitBits(lcdData,PWM_DATA_READY,true,true,portMAX_DELAY);
+    xEventGroupWaitBits(adcData,DATA_SENT,true,true,portMAX_DELAY);
     lcd_set_cursor(lcd,0,0);
     lcd_i2c_print_msg(lcd,msg);
     lcd_i2c_print_msg(lcd,velocidadMotor);
@@ -201,6 +199,8 @@ void lcdTask(void* args){
 void touchTask(void* args){
   static uint16_t motorDutyCycle=1024;
   static uint16_t servoDutyCycle=1024;
+  static char anguloDCStr[16];
+  static char velDCStr[16];
   init_pwm();
   ESP_ERROR_CHECK(touch_pad_init());
   touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER);
@@ -213,23 +213,23 @@ void touchTask(void* args){
   while (1){
     if(s_pad_activated[4]==1){ //Stop Servo
       servoDutyCycle=1024;
-      ESP_LOGI("TOUCH", "T4 activated!");
+      //ESP_LOGI("TOUCH", "T4 activated!");
       ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,servoDutyCycle));
       ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1));
       vTaskDelay(200 / portTICK_PERIOD_MS);
       s_pad_activated[4] = 0;
     }
     else if(s_pad_activated[5]==1){// Decrement Duty Cycle
-      servoDutyCycle=(servoDutyCycle>1034)?(servoDutyCycle-10):(1024);
-      ESP_LOGI("TOUCH", "T5 activated!");
+      servoDutyCycle=(servoDutyCycle>1034)?(servoDutyCycle-INC):(1024);
+      //ESP_LOGI("TOUCH", "T5 activated!");
       vTaskDelay(200 / portTICK_PERIOD_MS);
       ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,servoDutyCycle));
       ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1));
       s_pad_activated[5] = 0;
     }
     else if(s_pad_activated[6]==1){// Increment Duty Cycle
-      servoDutyCycle=(servoDutyCycle<MAX_DUTY)?(servoDutyCycle+10):(MAX_DUTY);
-      ESP_LOGI("TOUCH", "T6 activated!");
+      servoDutyCycle=(servoDutyCycle<MAX_DUTY)?(servoDutyCycle+INC):(MAX_DUTY);
+      //ESP_LOGI("TOUCH", "T6 activated!");
       vTaskDelay(200 / portTICK_PERIOD_MS);
       ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1,servoDutyCycle));
       ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_1));
@@ -237,26 +237,26 @@ void touchTask(void* args){
     }
     else if(s_pad_activated[7]==1){// Stop Motor
       motorDutyCycle=1024;
-      ESP_LOGI("TOUCH", "T7 activated!");
-      ESP_LOGW("TOUCH VAR","%d",motorDutyCycle);
+      //ESP_LOGI("TOUCH", "T7 activated!");
+      //ESP_LOGW("TOUCH VAR","%d",motorDutyCycle);
       vTaskDelay(200 / portTICK_PERIOD_MS);
       ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,motorDutyCycle));
       ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0));
       s_pad_activated[7] = 0;
     }
     else if(s_pad_activated[8]==1){// Decrement Motor Duty Cycle
-      motorDutyCycle=(motorDutyCycle>1034)?(motorDutyCycle-10):(1024);
-      ESP_LOGI("TOUCH", "T8 activated!");
-      ESP_LOGW("TOUCH VAR","%d",motorDutyCycle);
+      motorDutyCycle=(motorDutyCycle>1034)?(motorDutyCycle-INC):(1024);
+      //ESP_LOGI("TOUCH", "T8 activated!");
+      //ESP_LOGW("TOUCH VAR","%d",motorDutyCycle);
       vTaskDelay(200 / portTICK_PERIOD_MS);
       ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,motorDutyCycle));
       ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0));
       s_pad_activated[8] = 0;
     }
-    else if(s_pad_activated[9]==1){// Decrement Motor Duty Cycle
-      motorDutyCycle=(motorDutyCycle<MAX_DUTY)?(motorDutyCycle+10):(MAX_DUTY);
-      ESP_LOGI("TOUCH", "T9 activated!");
-      ESP_LOGW("TOUCH VAR","%d",motorDutyCycle);
+    else if(s_pad_activated[9]==1){// Increment Motor Duty Cycle
+      motorDutyCycle=(motorDutyCycle<MAX_DUTY)?(motorDutyCycle+INC):(MAX_DUTY);
+      //ESP_LOGI("TOUCH", "T9 activated!");
+      //ESP_LOGW("TOUCH VAR","%d",motorDutyCycle);
       vTaskDelay(200 / portTICK_PERIOD_MS);
       ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0,motorDutyCycle));
       ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE,LEDC_CHANNEL_0));
@@ -264,20 +264,18 @@ void touchTask(void* args){
     }
     sprintf(anguloServo,"%d",(int)((180*(servoDutyCycle-1024))/3072));
     sprintf(velocidadMotor,"%d",(int)(1250+(3750/4096)*motorDutyCycle));
-    xEventGroupSetBits(lcdData,PWM_DATA_READY);
+    sprintf(anguloDCStr,"S%d\n",servoDutyCycle);
+    sprintf(velDCStr,"M%d\n",motorDutyCycle);
+    uart_write_bytes(UART_NUM_1,(const char*)anguloDCStr,strlen((const char*)anguloDCStr));
+    uart_write_bytes(UART_NUM_1,(const char*)velDCStr,strlen((const char*)velDCStr));
     vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 }
 
-static void senderTimer(TimerHandle_t timer){
-  timeFlag=!timeFlag;
-}
-
 static void gpio_isr_handler(void* args){
-  static uint64_t last=0;
   uint8_t pinNumber = (uint8_t)(uintptr_t)args;
-  if((esp_timer_get_time()-last)>=150000){
-		last=esp_timer_get_time();
+  if((esp_timer_get_time()-lastPress)>=50000){
+		lastPress=esp_timer_get_time();
 	  xQueueSendFromISR(gpio_queue, &pinNumber, NULL);
 	}
 
@@ -285,10 +283,10 @@ static void gpio_isr_handler(void* args){
 
 void init_gpio(void){
   gpio_install_isr_service(0);
-  gpio_set_direction(GPIO_NUM_15, GPIO_MODE_INPUT);
-  gpio_set_intr_type(GPIO_NUM_15, GPIO_INTR_POSEDGE);
-  gpio_set_pull_mode(GPIO_NUM_15, GPIO_PULLDOWN_DISABLE);
-  gpio_isr_handler_add(GPIO_NUM_15, gpio_isr_handler, (void*)GPIO_NUM_15);
+  gpio_set_direction(GPIO_NUM_35, GPIO_MODE_INPUT);
+  gpio_set_intr_type(GPIO_NUM_35, GPIO_INTR_POSEDGE);
+  gpio_set_pull_mode(GPIO_NUM_35, GPIO_PULLDOWN_DISABLE);
+  gpio_isr_handler_add(GPIO_NUM_35, gpio_isr_handler, (void*)GPIO_NUM_35);
 }
 
 void init_pwm(void){
@@ -305,7 +303,7 @@ void init_pwm(void){
     .channel=LEDC_CHANNEL_0,
     .timer_sel=LEDC_TIMER_0,
     .intr_type=LEDC_INTR_DISABLE,
-    .gpio_num=GPIO_NUM_26,
+    .gpio_num=GPIO_NUM_26,//Blanco
     .duty=1024,
     .hpoint=0,
   };
@@ -315,7 +313,7 @@ void init_pwm(void){
     .channel=LEDC_CHANNEL_1,
     .timer_sel=LEDC_TIMER_0,
     .intr_type=LEDC_INTR_DISABLE,
-    .gpio_num=GPIO_NUM_25,
+    .gpio_num=GPIO_NUM_25,//Amarillo
     .duty=1024,
     .hpoint=0,
   };
